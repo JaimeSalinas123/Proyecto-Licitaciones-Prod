@@ -1,4 +1,4 @@
-v/**
+/**
  * Servidor web de DELPHOS Licitaciones.
  * Sirve el dashboard (public/) y expone la API para listar resultados,
  * lanzar una búsqueda nueva (con progreso en vivo por SSE) y descargar
