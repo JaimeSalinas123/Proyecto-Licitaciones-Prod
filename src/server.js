@@ -211,7 +211,7 @@ async function generarBufferPDF(fecha, licitaciones) {
   }
 }
 
-// Lógica de envío al n8n de Deinsa Global
+// Lógica de envío al n8n de Deinsa Global (Adaptada al formato de GitHub)
 async function enviarWebhook(fecha, licitaciones) {
   const webhookUrl = 'https://delphos.deinsa.com:5678/webhook/licitaciones';
   
@@ -220,15 +220,25 @@ async function enviarWebhook(fecha, licitaciones) {
     const pdfBuffer = await generarBufferPDF(fecha, licitaciones);
     
     const form = new FormData();
-    form.append('file', pdfBuffer, {
-      filename: `licitaciones-${fecha}.pdf`,
+    // CRÍTICO: Usar 'data' en lugar de 'file' y el nombre exacto 'licitaciones.pdf'
+    form.append('data', pdfBuffer, {
+      filename: 'licitaciones.pdf',
       contentType: 'application/pdf',
     });
-    form.append('timestamp', new Date().toISOString());
-    form.append('origen', 'Render-Scraper-Delphos');
+    
+    // Añadimos exactamente los mismos metadatos que el código de GitHub
+    form.append('fileName', 'licitaciones.pdf');
+    form.append('fileSize', String(pdfBuffer.length));
+    form.append('fecha', fecha);
+    form.append('total', String(licitaciones.length));
+    form.append('uploadedAt', new Date().toISOString());
 
     const response = await axios.post(webhookUrl, form, {
-      headers: { ...form.getHeaders() }
+      headers: { 
+        ...form.getHeaders(),
+        // Se añade el User-Agent para replicar la evasión del firewall de Deinsa
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      }
     });
 
     console.log(`[Webhook] Reporte enviado exitosamente. Estado: ${response.status}`);
