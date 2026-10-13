@@ -1,8 +1,8 @@
 /**
  * Servidor web de DELPHOS Licitaciones.
  * Sirve el dashboard (public/) y expone la API para listar resultados,
- * lanzar una búsqueda nueva (con progreso en vivo por SSE), descargar
- * resultados y enviar el reporte final a n8n automáticamente.
+ * lanzar una búsqueda nueva (con progreso en vivo por SSE) y descargar
+ * los resultados en JSON o PDF, además de soportar automatización.
  */
 
 import express from 'express';
@@ -21,12 +21,11 @@ const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 const app = express();
 app.use(express.static(join(__dirname, '..', 'public')));
-app.use('/data', express.static(join(ROOT, 'data')));
 
 // ─── Estado del job de búsqueda (uno a la vez, en memoria) ───────────────────
 
 const job = {
-  estado: 'inactivo', 
+  estado: 'inactivo', // inactivo | ejecutando | completado | error
   progreso: 0,
   eventos: [],
   resumen: null,
@@ -44,61 +43,6 @@ function emitir(evento) {
   }
 }
 
-// ─── LÓGICA DE ENVÍO A N8N (100% INDEPENDIENTE) ───────────────────────────────
-
-async function generarBufferPDF(fecha, licitaciones) {
-  let browser;
-  try {
-    const html = generarHTMLReporte(fecha, licitaciones);
-    browser = await chromium.launch();
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: 'networkidle' });
-    return await page.pdf({
-      format: 'A4',
-      printBackground: true,
-      margin: { top: '18mm', bottom: '16mm', left: '14mm', right: '14mm' }
-    });
-  } finally {
-    if (browser) await browser.close();
-  }
-}
-
-async function enviarWebhook(fecha, licitaciones) {
-  const webhookUrl = process.env.N8N_WEBHOOK_URL || 'https://delphos.deinsa.com:5678/webhook/licitaciones';
-  
-  try {
-    console.log('Generando PDF para enviar al webhook...');
-    const pdfBuffer = await generarBufferPDF(fecha, licitaciones);
-    
-    const form = new FormData();
-    // Las etiquetas idénticas a las que funcionaban en el repo original
-    form.append('data', pdfBuffer, {
-      filename: 'licitaciones.pdf',
-      contentType: 'application/pdf',
-    });
-    form.append('fileName', 'licitaciones.pdf');
-    form.append('fileSize', String(pdfBuffer.length));
-    form.append('fecha', fecha);
-    form.append('total', String(licitaciones.length));
-    form.append('uploadedAt', new Date().toISOString());
-
-    const response = await axios.post(webhookUrl, form, {
-      headers: { 
-        ...form.getHeaders(),
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      },
-      timeout: 60000
-    });
-
-    console.log(`[Webhook] Reporte enviado exitosamente. Estado: ${response.status}`);
-  } catch (error) {
-    const detalle = error.response ? `status ${error.response.status}` : error.message;
-    console.error(`[Webhook] Error al enviar a n8n: ${detalle}`);
-  }
-}
-
-// ─── NÚCLEO DE BÚSQUEDA Y AUTOMATIZACIÓN ──────────────────────────────────────
-
 async function lanzarBusqueda() {
   if (job.estado === 'ejecutando') return false;
 
@@ -111,19 +55,6 @@ async function lanzarBusqueda() {
 
   try {
     const { resumen } = await ejecutarBusqueda(emitir);
-    
-    if (resumen) {
-      const match = resumen.archivo.match(/licitaciones-(\d{4}-\d{2}-\d{2})\.json/);
-      if (match) {
-        const fecha = match[1];
-        const licitaciones = leerLicitaciones(fecha);
-        if (licitaciones && licitaciones.length > 0) {
-          emitir({ type: 'n8n', message: 'Generando y enviando PDF a n8n...' });
-          await enviarWebhook(fecha, licitaciones);
-        }
-      }
-    }
-
     job.estado = 'completado';
     job.resumen = resumen;
     emitir({ type: 'server-fin', message: 'Búsqueda finalizada', progress: 100, data: resumen });
@@ -135,25 +66,44 @@ async function lanzarBusqueda() {
   return true;
 }
 
-// ─── ENDPOINTS PARA CRON-JOB.ORG ──────────────────────────────────────────────
+// ─── ENDPOINTS PARA AUTOMATIZACIÓN (CRON-JOB & RENDER KEEP-ALIVE) ────────────
 
+// 1. Endpoint Keep-Alive para evitar que Render se apague a los 15 minutos
 app.get('/ping', (req, res) => {
   res.status(200).send('Servidor activo para procesos de Delphos');
 });
 
+// 2. Endpoint disparador para cron-job.org
 app.get('/api/trigger-licitaciones', (req, res) => {
   if (job.estado === 'ejecutando') {
     return res.status(409).json({ ok: false, message: 'Ya hay una búsqueda en curso.' });
   }
 
-  // Respondemos rápido a cron-job para que no marque error por timeout
+  // Respondemos 202 Accepted inmediatamente para no causar timeout en el Cron
   res.status(202).json({ ok: true, message: 'Proceso de scraping iniciado en segundo plano.' });
 
-  // Disparamos el motor, que ahora incluye internamente el envío a n8n
-  lanzarBusqueda().catch(err => console.error('Error crítico:', err));
+  // Ejecución asíncrona
+  lanzarBusqueda().then(async () => {
+    if (job.estado === 'completado' && job.resumen) {
+      console.log('Búsqueda automatizada finalizada. Preparando reporte para n8n...');
+      // Extraemos la fecha del nombre del archivo generado (ej. data/results/licitaciones-2026-10-01.json)
+      const match = job.resumen.archivo.match(/licitaciones-(\d{4}-\d{2}-\d{2})\.json/);
+      if (match) {
+        const fecha = match[1];
+        const licitaciones = leerLicitaciones(fecha);
+        if (licitaciones && licitaciones.length > 0) {
+          await enviarWebhook(fecha, licitaciones);
+        } else {
+          console.log('No se enviará webhook: 0 licitaciones encontradas hoy.');
+        }
+      }
+    }
+  }).catch(err => {
+    console.error('Error crítico en el flujo automatizado:', err);
+  });
 });
 
-// ─── API DEL DASHBOARD Y OTRAS RUTAS ──────────────────────────────────────────
+// ─── API: estado y progreso ───────────────────────────────────────────────────
 
 app.get('/api/estado', (req, res) => {
   res.json({ estado: job.estado, progreso: job.progreso, resumen: job.resumen, error: job.error });
@@ -185,6 +135,8 @@ app.post('/api/buscar', express.json(), async (req, res) => {
   });
 });
 
+// ─── FUNCIONES DE APOYO Y PDF ─────────────────────────────────────────────────
+
 function listarResultados() {
   if (!existsSync(RESULTS_DIR)) return [];
   return readdirSync(RESULTS_DIR)
@@ -207,14 +159,6 @@ function listarResultados() {
     })
     .sort((a, b) => b.fecha.localeCompare(a.fecha));
 }
-
-app.get('/data/manifest.json', (req, res) => {
-  try {
-    res.json(listarResultados());
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.get('/api/resultados', (req, res) => {
   try {
@@ -249,6 +193,60 @@ app.get('/api/resultados/:fecha/descargar', (req, res) => {
   res.download(archivo, `licitaciones-${fecha}.json`);
 });
 
+// Función interna para generar el PDF como Buffer en memoria
+async function generarBufferPDF(fecha, licitaciones) {
+  let browser;
+  try {
+    const html = generarHTMLReporte(fecha, licitaciones);
+    browser = await chromium.launch();
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle' });
+    return await page.pdf({
+      format: 'A4',
+      printBackground: true,
+      margin: { top: '18mm', bottom: '16mm', left: '14mm', right: '14mm' }
+    });
+  } finally {
+    if (browser) await browser.close();
+  }
+}
+
+// Lógica de envío al n8n de Deinsa Global (Adaptada al formato de GitHub)
+async function enviarWebhook(fecha, licitaciones) {
+  const webhookUrl = 'https://delphos.deinsa.com:5678/webhook/licitaciones';
+  
+  try {
+    console.log('Generando PDF para enviar al webhook...');
+    const pdfBuffer = await generarBufferPDF(fecha, licitaciones);
+    
+    const form = new FormData();
+    // CRÍTICO: Usar 'data' en lugar de 'file' y el nombre exacto 'licitaciones.pdf'
+    form.append('data', pdfBuffer, {
+      filename: 'licitaciones.pdf',
+      contentType: 'application/pdf',
+    });
+    
+    // Añadimos exactamente los mismos metadatos que el código de GitHub
+    form.append('fileName', 'licitaciones.pdf');
+    form.append('fileSize', String(pdfBuffer.length));
+    form.append('fecha', fecha);
+    form.append('total', String(licitaciones.length));
+    form.append('uploadedAt', new Date().toISOString());
+
+    const response = await axios.post(webhookUrl, form, {
+      headers: { 
+        ...form.getHeaders(),
+        // Se añade el User-Agent para replicar la evasión del firewall de Deinsa
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      }
+    });
+
+    console.log(`[Webhook] Reporte enviado exitosamente. Estado: ${response.status}`);
+  } catch (error) {
+    console.error(`[Webhook] Error al enviar a n8n: ${error.message}`);
+  }
+}
+
 app.get('/api/resultados/:fecha/pdf', async (req, res) => {
   try {
     const licitaciones = leerLicitaciones(req.params.fecha);
@@ -260,18 +258,6 @@ app.get('/api/resultados/:fecha/pdf', async (req, res) => {
       'Content-Disposition': `attachment; filename="licitaciones-${req.params.fecha}.pdf"`
     });
     res.send(pdfBuffer);
-  } catch (err) {
-    res.status(500).json({ error: `No se pudo generar el PDF: ${err.message}` });
-  }
-});
-
-app.get('/data/results/licitaciones-:fecha.pdf', async (req, res) => {
-  try {
-    const licitaciones = leerLicitaciones(req.params.fecha);
-    if (licitaciones === null) return res.status(404).json({ error: 'No hay resultados para esa fecha' });
-
-    const pdfBuffer = await generarBufferPDF(req.params.fecha, licitaciones);
-    res.set('Content-Type', 'application/pdf').send(pdfBuffer);
   } catch (err) {
     res.status(500).json({ error: `No se pudo generar el PDF: ${err.message}` });
   }
